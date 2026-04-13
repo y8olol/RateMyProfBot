@@ -1,0 +1,5 @@
+node_modules/
+review_history/
+.env
+*.log
+.DS_Store
