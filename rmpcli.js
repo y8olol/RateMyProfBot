@@ -81,7 +81,6 @@ const argv = yargs(hideBin(process.argv))
       "D",
       "F",
     ],
-    default: "A+",
     description: "Grade received",
   })
   .option("review", {
@@ -92,6 +91,16 @@ const argv = yargs(hideBin(process.argv))
     alias: "k",
     type: "string",
     description: "OpenRouter API key for AI-generated reviews",
+  })
+  .option("groqKey", {
+    alias: "g",
+    type: "string",
+    description: "Groq API key (fallback if OpenRouter fails)",
+  })
+  .option("cookies", {
+    alias: "c",
+    type: "string",
+    description: "Path to a JSON file containing cookies to inject into the browser session",
   })
   .option("workers", {
     alias: "w",
@@ -152,11 +161,29 @@ function loadHistory(profId) {
   catch (_) { return []; }
 }
 
-function saveToHistory(profId, text) {
+function saveToHistory(profId, text, cookieId = null) {
   const p = getHistoryPath(profId);
   const reviews = loadHistory(profId);
-  reviews.push({ text, submittedAt: new Date().toISOString() });
+  reviews.push({ text, submittedAt: new Date().toISOString(), ...(cookieId ? { cookieId } : {}) });
   fs.writeFileSync(p, JSON.stringify({ reviews }, null, 2), 'utf8');
+}
+
+// ── Cookie identity helpers ──────────────────────────────────────────────────
+// Derive a short stable ID from a cookie array so we can track "1 review per
+// cookie per prof" without storing the raw token on disk.
+const crypto = require('crypto');
+
+function cookieIdentity(cookies) {
+  if (!cookies || cookies.length === 0) return null;
+  // Use the value of the first auth-looking cookie, otherwise all values joined
+  const authCookie = cookies.find(c => /auth|token|session|sid/i.test(c.name)) || cookies[0];
+  return crypto.createHash('sha256').update(authCookie.value).digest('hex').slice(0, 16);
+}
+
+function cookieAlreadyUsed(profId, cookieId) {
+  if (!cookieId) return false;
+  const history = loadHistory(profId);
+  return history.some(r => r.cookieId === cookieId);
 }
 
 function isDuplicate(text, history) {
@@ -276,43 +303,93 @@ function looksLikeReview(text) {
 
 
 
-// Lightweight AI check: does the text have no names, no colons, no quotes, and is an actual review?
-async function aiCheckReview(openrouterKey, text) {
+// ── Model pool ───────────────────────────────────────────────────────────────
+// Tracks per-model cooldowns. When a model fails it goes on a 1hr cooldown.
+const MODEL_COOLDOWNS = {}; // key: "provider:model" → timestamp when cooldown expires
+
+const GROQ_MODELS = [
+  "llama-3.3-70b-versatile",
+  "llama-3.1-8b-instant",
+  "moonshotai/kimi-k2-instruct",
+  "qwen/qwen3-32b",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "allam-2-7b",
+];
+
+const OPENROUTER_MODELS = [
+  "arcee-ai/trinity-large-preview:free",
+  "mistralai/mistral-7b-instruct:free",
+  "huggingfaceh4/zephyr-7b-beta:free",
+];
+
+const COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+function markCooldown(provider, model) {
+  const key = `${provider}:${model}`;
+  MODEL_COOLDOWNS[key] = Date.now() + COOLDOWN_MS;
+  console.log(chalk.yellow(`  ⏳ ${provider}/${model} on cooldown for 1hr`));
+}
+
+function isOnCooldown(provider, model) {
+  const key = `${provider}:${model}`;
+  if (!MODEL_COOLDOWNS[key]) return false;
+  if (Date.now() > MODEL_COOLDOWNS[key]) { delete MODEL_COOLDOWNS[key]; return false; }
+  return true;
+}
+
+// Call a single model. Returns the raw text response or throws on failure.
+async function callModel(provider, model, apiKey, messages, temperature, maxTokens = 200) {
+  const url = provider === 'groq'
+    ? 'https://api.groq.com/openai/v1/chat/completions'
+    : 'https://openrouter.ai/api/v1/chat/completions';
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status}: ${body.slice(0, 120)}`);
+  }
+
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error('Empty response from model');
+  return text;
+}
+
+// Pick the next available (non-cooldown) model from the pool.
+// Returns { provider, model, apiKey } or null if all are cooling down.
+function pickModel(openrouterKey, groqKey) {
+  const candidates = [];
+  if (groqKey)       GROQ_MODELS.forEach(m => candidates.push({ provider: 'groq', model: m, apiKey: groqKey }));
+  if (openrouterKey) OPENROUTER_MODELS.forEach(m => candidates.push({ provider: 'openrouter', model: m, apiKey: openrouterKey }));
+
+  for (const c of candidates) {
+    if (!isOnCooldown(c.provider, c.model)) return c;
+  }
+  return null; // all on cooldown
+}
+
+// Lightweight local check: does text look like a real review?
+async function aiCheckReview(openrouterKey, groqKey, text) {
+  const picked = pickModel(openrouterKey, groqKey);
+  if (!picked) return { valid: true }; // can't check, don't block
   try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${openrouterKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "arcee-ai/trinity-large-preview:free",
-        messages: [
-          { role: "system", content: "You are a text validator. Reply with only YES or NO." },
-          { role: "user", content: `Does this text satisfy ALL of these rules?
-1. No person's name mentioned (no Professor Smith, Dr. Lee, etc.)
-2. No colon characters (:)
-3. No quote characters (" or ')
-4. Is an actual review sentence(s), not instructions or meta-text
-
-Text: ${text}
-
-Reply YES if all 4 rules pass, NO if any fail.` }
-        ],
-        max_tokens: 5,
-        temperature: 0,
-      }),
-    });
-    if (!res.ok) return { valid: true }; // don't block on API failure
-    const data = await res.json();
-    const answer = (data.choices?.[0]?.message?.content || '').trim().toUpperCase();
-    return answer.startsWith('YES') ? { valid: true } : { valid: false, reason: 'failed AI rules check' };
+    const answer = await callModel(picked.provider, picked.model, picked.apiKey, [
+      { role: 'system', content: 'You are a text validator. Reply with only YES or NO.' },
+      { role: 'user', content: `Does this text satisfy ALL of these rules?\n1. No person's name mentioned\n2. No colon characters (:)\n3. No quote characters\n4. Is an actual review, not instructions\n\nText: ${text}\n\nReply YES or NO.` },
+    ], 0, 5);
+    return answer.toUpperCase().startsWith('YES') ? { valid: true } : { valid: false, reason: 'failed AI rules check' };
   } catch (_) {
-    return { valid: true }; // don't block on network error
+    return { valid: true };
   }
 }
 
-// Generate a unique review via OpenRouter using arcee-ai/trinity-large-preview:free.
-// Checks against the professor's stored review history and retries with escalating
-// temperature + duplicate feedback if the model produces something already used.
-async function generateReview(openrouterKey, profId, { rating, difficulty, wouldTakeAgain, grade }, pfx = '') {
+// Generate a unique review, rotating through all available models with cooldown tracking.
+async function generateReview(openrouterKey, profId, { rating, difficulty, wouldTakeAgain, grade }, pfx = '', groqKey = null) {
   const ratingLabel = ['Awful', 'Awful', 'Poor', 'Average', 'Good', 'Awesome'][rating] || 'Average';
   const diffLabel   = ['N/A', 'Very Easy', 'Easy', 'Medium', 'Hard', 'Very Hard'][difficulty] || 'Medium';
 
@@ -327,6 +404,10 @@ async function generateReview(openrouterKey, profId, { rating, difficulty, would
     // No previously-rejected text injected — just let temperature escalation drive variation
     const extraRules = attempt > 1 ? `\n- Vary your sentence structure and opening word from previous attempts` : '';
 
+    const sentiment = rating >= 4 ? 'positive — the student enjoyed this professor'
+                    : rating <= 2 ? 'negative — the student had a bad experience and would NOT recommend this professor'
+                    : 'mixed — the student had an average experience, neither strongly positive nor negative';
+
     const systemPrompt = `You are a college student writing a short professor review. Output ONLY the review itself — nothing else.
 
 FORBIDDEN — do not output any of these:
@@ -334,10 +415,13 @@ FORBIDDEN — do not output any of these:
 - Title + name combos like "Professor Smith", "Dr. Lee", "Prof. Chen" — use "the professor" or "they" instead
 - Planning text, sentence labels, instructions, meta-commentary
 - Colons or quote characters
+- Any mention of grades, GPA, or academic scores (A+, B-, etc.)
+
+REQUIRED: The tone of the review MUST be ${sentiment}. Do not contradict this sentiment.
 
 Your entire response must be 3-5 sentences of casual student review prose. Begin immediately with the first sentence.${extraRules}`;
 
-    const userPrompt = `Scores — Rating: ${rating}/5 (${ratingLabel}), Difficulty: ${difficulty}/5 (${diffLabel}), Would take again: ${wouldTakeAgain}, Grade: ${grade}. Write the review now.`;
+    const userPrompt = `Scores — Rating: ${rating}/5 (${ratingLabel}), Difficulty: ${difficulty}/5 (${diffLabel}), Would take again: ${wouldTakeAgain}. Write the review now. Do NOT mention any grade or GPA in the review.`;
 
     if (attempt === 1) {
       console.log(chalk.yellow(`${pfx}Generating AI review... (${history.length} previous on record for prof ${profId})`));
@@ -345,31 +429,26 @@ Your entire response must be 3-5 sentences of casual student review prose. Begin
       console.log(chalk.yellow(`${pfx}Duplicate — regenerating (attempt ${attempt}/${MAX_ATTEMPTS}, temp=${temperature})...`));
     }
 
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${openrouterKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "arcee-ai/trinity-large-preview:free",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user",   content: userPrompt },
-        ],
-        max_tokens: 200,
-        temperature,
-      }),
-    });
+    // Pick next available model from the pool
+    const picked = pickModel(openrouterKey, groqKey);
+    if (!picked) {
+      throw new Error('All AI models are on cooldown. Try again later or wait for cooldowns to expire.');
+    }
+    console.log(chalk.dim(`${pfx}  Using ${picked.provider}/${picked.model}`));
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`OpenRouter API error ${res.status}: ${err}`);
+    let raw;
+    try {
+      raw = await callModel(picked.provider, picked.model, picked.apiKey, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt },
+      ], temperature);
+    } catch (err) {
+      console.log(chalk.yellow(`${pfx}⚠ ${picked.provider}/${picked.model} failed: ${err.message} — putting on cooldown`));
+      markCooldown(picked.provider, picked.model);
+      continue; // try next model on next attempt
     }
 
-    const data = await res.json();
-    const raw = data.choices?.[0]?.message?.content?.trim();
-    if (!raw) throw new Error("OpenRouter returned empty response");
+    if (!raw) throw new Error("Model returned empty response");
 
     // Clean the text before using it:
     // 1. Strip prompt-leakage lines (lines that look like instructions, not prose)
@@ -384,7 +463,7 @@ Your entire response must be 3-5 sentences of casual student review prose. Begin
     }
 
     // AI check — verify no names, no colons, no quotes, actual review
-    const aiCheck = await aiCheckReview(openrouterKey, text);
+    const aiCheck = await aiCheckReview(openrouterKey, groqKey, text);
     if (!aiCheck.valid) {
       console.log(chalk.yellow(`${pfx}⚠ AI check failed (${aiCheck.reason}), retrying...`));
       previouslyRejected = text;
@@ -397,7 +476,7 @@ Your entire response must be 3-5 sentences of casual student review prose. Begin
       continue;
     }
 
-    console.log(chalk.green(`${pfx}✓ Unique review ready (${text.length} chars): "${text.slice(0, 60)}..."`));
+    console.log(chalk.green(`${pfx}✓ Unique review ready via ${picked.provider}/${picked.model} (${text.length} chars): "${text.slice(0, 60)}..."`));
     return text;
   }
 
@@ -590,6 +669,84 @@ async function verifyForm(page, {
   }, { rating, difficulty, wouldTakeAgain, forCredit, usesTextbooks, attendanceMandatory, reviewText });
 }
 
+// Load a multi-account cookies file.
+// Supported formats:
+//
+//   1. Array of accounts — each entry is either:
+//      a) A Playwright cookie array:          [ [{name,value,...}, ...], [{...}, ...] ]
+//      b) A flat key->value map per account:  [ { rmpAuth: "eyJ..." }, { rmpAuth: "eyJ..." } ]
+//
+//   2. Single account (backwards-compat) — same as format 1 but with one entry:
+//      { rmpAuth: "eyJ..." }   or   [{name,value,...}]
+//
+// Returns an array of "account" arrays, where each account is a Playwright cookie array.
+function loadCookiesFile(filePath) {
+  if (!filePath) return null;
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) throw new Error(`Cookies file not found: ${resolved}`);
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(resolved, 'utf8')); }
+  catch (e) { throw new Error(`Failed to parse cookies JSON: ${e.message}`); }
+
+  const normaliseAccount = (entry) => {
+    // Already a Playwright cookie array
+    if (Array.isArray(entry)) return entry;
+    // Flat key->value map
+    if (typeof entry === 'object' && entry !== null) {
+      return Object.entries(entry).map(([name, value]) => ({
+        name, value: String(value),
+        domain: '.ratemyprofessors.com', path: '/',
+        httpOnly: false, secure: true, sameSite: 'None',
+      }));
+    }
+    throw new Error('Each account entry must be an object or array.');
+  };
+
+  // Top-level array → could be multi-account or single Playwright cookie array
+  if (Array.isArray(raw)) {
+    // If every element is a cookie object (has .name + .value) treat as single account
+    const looksLikeCookieList = raw.every(e => typeof e === 'object' && e !== null && 'name' in e && 'value' in e);
+    if (looksLikeCookieList) return [raw]; // single account in Playwright format
+    // Otherwise it's an array of accounts
+    return raw.map(normaliseAccount);
+  }
+  // Top-level plain object → single flat account
+  if (typeof raw === 'object' && raw !== null) return [normaliseAccount(raw)];
+  throw new Error('Cookies file must be a JSON array or object.');
+}
+
+// Given the loaded accounts array and a profId, pick the first account whose
+// cookieId has NOT already been used for that prof. Returns { cookies, cookieId }
+// or null if all accounts are exhausted.
+function pickUnusedAccount(accounts, profId) {
+  for (const cookies of accounts) {
+    const id = cookieIdentity(cookies);
+    if (!cookieAlreadyUsed(profId, id)) return { cookies, cookieId: id };
+  }
+  return null;
+}
+
+// Pick tags based on rating: 5 = good, 1 = bad, 2-4 = random mix
+function pickTags(rating) {
+  const good = ["Amazinglectures", "Givesgoodfeedback", "Inspirational", "Respected", "Caring"];
+  const bad  = ["Toughgrader", "Getreadytoread", "Lectureheavy", "Skipclassyouwontpass", "Gradedbyfewthings"];
+  const all  = [...good, ...bad];
+  const shuffle = (arr) => arr.slice().sort(() => Math.random() - 0.5);
+  const randCount = () => 2 + Math.floor(Math.random() * 3); // 2, 3, or 4
+
+  if (rating >= 5) return shuffle(good).slice(0, randCount());
+  if (rating <= 1) return shuffle(bad).slice(0, randCount());
+  return shuffle(all).slice(0, randCount());
+}
+
+function pickGrade(rating) {
+  const good = ["A+", "A", "A-"];
+  const mid  = ["B+", "B", "B-", "C+", "C"];
+  const bad  = ["C-", "D+", "D", "F"];
+  const pool = rating >= 5 ? good : rating <= 1 ? bad : mid;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 // Main rating function
 async function rateProfessor(profId, options = {}) {
   const {
@@ -602,27 +759,47 @@ async function rateProfessor(profId, options = {}) {
     forCredit = "Yes",
     usesTextbooks = "No",
     attendanceMandatory = "No",
-    grade = "A+",
-    tags = ["Amazinglectures", "Givesgoodfeedback", "Inspirational"],
+    grade = null,
+    tags = null,
     reviewText = "This professor is amazing! Lectures are engaging and well-structured. " +
       "Cares about student success and provides helpful feedback. " +
       "Highly recommend taking their course.",
     showSubmitPrompt = false,
     interactive = false,
     openrouterKey = null,
+    groqKey = null,
+    cookies = null,
     _attemptLabel = '',
   } = options;
   const pfx = _attemptLabel ? _attemptLabel + ' ' : '';
+  const cookieId = cookieIdentity(cookies);
 
-  // Generate review via AI if a key is provided and no manual review was given
-  let finalReviewText = reviewText;
-  if (openrouterKey && !options.reviewText) {
-    finalReviewText = await generateReview(openrouterKey, profId, { rating, difficulty, wouldTakeAgain, grade }, pfx);
+  // ── Cookie-mode guard: enforce 1 review per cookie per prof ─────────────
+  if (cookieId) {
+    if (cookieAlreadyUsed(profId, cookieId)) {
+      console.log(chalk.red(`${pfx}✗ This cookie account has already submitted a review for prof ${profId}. Skipping.`));
+      return;
+    }
+    console.log(chalk.cyan(`${pfx}🍪 Cookie mode — session ID: ${cookieId}`));
+  }
+
+  // Resolve grade and tags before anything else so AI review text matches
+  const resolvedGrade = grade || pickGrade(rating);
+  const resolvedTags  = tags  || pickTags(rating);
+
+  // Generate review via AI if a key is provided and no manual review was given.
+  // NOTE: pre-generated review is passed in via options._generatedReview so that
+  // parallel workers don't block each other waiting for the AI response.
+  let finalReviewText = options._generatedReview || reviewText;
+  if ((openrouterKey || groqKey) && !options.reviewText && !options._generatedReview) {
+    finalReviewText = await generateReview(openrouterKey, profId, { rating, difficulty, wouldTakeAgain, grade: resolvedGrade }, pfx, groqKey);
   }
 
   const formOptions = {
     courseCode, rating, difficulty, wouldTakeAgain,
-    forCredit, usesTextbooks, attendanceMandatory, grade, tags,
+    forCredit, usesTextbooks, attendanceMandatory,
+    grade: resolvedGrade,
+    tags: resolvedTags,
     reviewText: finalReviewText,
   };
 
@@ -633,6 +810,12 @@ async function rateProfessor(profId, options = {}) {
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   });
+
+  // Inject cookies if provided
+  if (cookies && cookies.length > 0) {
+    await context.addCookies(cookies);
+    console.log(chalk.cyan(`${pfx}🍪 Injected ${cookies.length} cookie(s) from file`));
+  }
   const page = await context.newPage();
 
   let submit = false;
@@ -709,7 +892,7 @@ async function rateProfessor(profId, options = {}) {
       await submitBtn.click({ force: true });
       await page.waitForTimeout(5000);
       console.log(chalk.green(`${pfx}✓ Form submitted!`));
-      saveToHistory(profId, finalReviewText);
+      saveToHistory(profId, finalReviewText, cookieId);
       console.log(chalk.dim(`${pfx}  Review saved to history (prof ${profId}, total: ${loadHistory(profId).length})`));
     } else {
       console.log(chalk.blue("Submission skipped. Browser left open for manual review."));
@@ -911,6 +1094,24 @@ async function main() {
   if (argv.grade) options.grade = argv.grade;
   if (argv.review) options.reviewText = argv.review;
   if (argv.openrouterKey) options.openrouterKey = argv.openrouterKey;
+  if (argv.groqKey) options.groqKey = argv.groqKey;
+
+  // Load multi-account cookies file — store all accounts, workers pick individually
+  let cookieAccounts = null;
+  if (argv.cookies) {
+    try {
+      cookieAccounts = loadCookiesFile(argv.cookies);
+      console.log(chalk.cyan(`Loaded ${cookieAccounts.length} account(s) from ${argv.cookies}`));
+      // Early exit if none are available at all
+      if (pickUnusedAccount(cookieAccounts, profId) === null) {
+        console.log(chalk.red(`All ${cookieAccounts.length} cookie account(s) have already submitted a review for prof ${profId}. Nothing to do.`));
+        process.exit(0);
+      }
+    } catch (err) {
+      console.error(chalk.red(`Failed to load cookies: ${err.message}`));
+      process.exit(1);
+    }
+  }
 
   // Only show submit prompt in fully interactive mode (when we prompted for both ID and customization)
   const showSubmitPrompt = interactive && customize;
@@ -925,7 +1126,23 @@ async function main() {
     ...options,
     showSubmitPrompt,
     interactive,
+    _cookieAccounts: cookieAccounts,
   };
+
+  // Mutex for cookie picking — prevents parallel workers grabbing the same account
+  const _cookieLock = { locked: false, queue: [] };
+  async function pickCookieSafe(profId) {
+    await new Promise(resolve => {
+      if (!_cookieLock.locked) { _cookieLock.locked = true; resolve(); }
+      else _cookieLock.queue.push(resolve);
+    });
+    try {
+      return pickUnusedAccount(rateOptions._cookieAccounts, profId);
+    } finally {
+      const next = _cookieLock.queue.shift();
+      if (next) next(); else _cookieLock.locked = false;
+    }
+  }
 
   // Run a single batch of `workers` submissions in parallel.
   // Returns { passed, failed } counts for the batch.
@@ -934,12 +1151,42 @@ async function main() {
     if (loop) console.log(chalk.cyan(`\n${batchLabel} Launching ${workers} workers...`));
     else if (workers > 1) console.log(chalk.cyan(`\nLaunching ${workers} parallel workers...`));
 
+    // Pre-generate all AI reviews in parallel before launching browsers
+    let preGenerated = [];
+    const hasAiKey = rateOptions.openrouterKey || rateOptions.groqKey;
+    if (hasAiKey && !rateOptions.reviewText) {
+      console.log(chalk.yellow(`${batchLabel} Pre-generating ${workers} AI review(s) in parallel...`));
+      preGenerated = await Promise.all(
+        Array.from({ length: workers }, (_, i) => {
+          const label = chalk.bold(`[#${startIdx + i + 1}]`);
+          return generateReview(rateOptions.openrouterKey, profId, {
+            rating: rateOptions.rating ?? 5,
+            difficulty: rateOptions.difficulty ?? 2,
+            wouldTakeAgain: rateOptions.wouldTakeAgain ?? 'Yes',
+            grade: rateOptions.grade || pickGrade(rateOptions.rating ?? 5),
+          }, label, rateOptions.groqKey).catch(() => null);
+        })
+      );
+      console.log(chalk.green(`${batchLabel} ✓ Reviews ready, launching browsers...`));
+    }
+
     const tasks = Array.from({ length: workers }, (_, i) => {
       const globalIdx = startIdx + i + 1;
       const label = chalk.bold(loop ? `[#${globalIdx}]` : `[#${i + 1}]`);
       return (async () => {
         try {
-          await rateProfessor(profId, { ...rateOptions, _attemptLabel: label });
+          // In cookie mode, each worker picks its own unused account
+          let workerOptions = { ...rateOptions, _attemptLabel: label };
+          if (preGenerated[i]) workerOptions._generatedReview = preGenerated[i];
+          if (rateOptions._cookieAccounts) {
+            const picked = pickUnusedAccount(rateOptions._cookieAccounts, profId);
+            if (!picked) {
+              console.log(chalk.yellow(`${label} No unused cookie accounts left — stopping.`));
+              return { idx: globalIdx, success: false, exhausted: true };
+            }
+            workerOptions.cookies = picked.cookies;
+          }
+          await rateProfessor(profId, workerOptions);
           console.log(chalk.green(`${label} ✓ Submitted successfully`));
           return { idx: globalIdx, success: true };
         } catch (err) {
@@ -952,16 +1199,17 @@ async function main() {
     const results = await Promise.allSettled(tasks);
     const resolved = results.map(r => r.value ?? r.reason);
 
-    let passed = 0, failed = 0;
+    let passed = 0, failed = 0, exhausted = 0;
     console.log(chalk.cyan(`\n── ${loop ? batchLabel + ' ' : ''}Results ${'─'.repeat(30)}`));
     for (const r of resolved) {
-      if (r?.success) { console.log(chalk.green(`  #${r.idx} ✓ Success`)); passed++; }
+      if (r?.exhausted) { console.log(chalk.yellow(`  #${r.idx} ⏭ Skipped (no accounts left)`)); exhausted++; }
+      else if (r?.success) { console.log(chalk.green(`  #${r.idx} ✓ Success`)); passed++; }
       else { console.log(chalk.red(`  #${r.idx} ✗ Failed${r?.error ? ': ' + r.error : ''}`)); failed++; }
     }
     console.log(chalk.cyan('─'.repeat(40)));
     console.log(chalk.white(`  Workers: ${workers}  `) + chalk.green(`Passed: ${passed}  `) + chalk.red(`Failed: ${failed}`));
     console.log(chalk.cyan('─'.repeat(40) + '\n'));
-    return { passed, failed };
+    return { passed, failed, exhausted };
   }
 
   if (!loop) {
@@ -991,21 +1239,47 @@ async function main() {
 
     while (total === 0 || submitted < total) {
       const remaining = total === 0 ? workers : Math.min(workers, total - submitted);
-      // Temporarily override workers for last partial batch
-      const savedWorkers = workers;
       batchNum++;
 
       const batchWorkers = remaining;
-      // Patch runBatch to use batchWorkers — easier to just inline
       const batchLabel = chalk.cyan(`[Batch ${batchNum}]`);
       console.log(chalk.cyan(`\n${batchLabel} Launching ${batchWorkers} workers... (${total > 0 ? submitted + '/' + total : submitted + ' so far'})`));
+
+      // Pre-generate all AI reviews in parallel before launching browsers
+      let preGenerated = [];
+      const hasAiKey = rateOptions.openrouterKey || rateOptions.groqKey;
+      if (hasAiKey && !rateOptions.reviewText) {
+        console.log(chalk.yellow(`${batchLabel} Pre-generating ${batchWorkers} AI review(s) in parallel...`));
+        preGenerated = await Promise.all(
+          Array.from({ length: batchWorkers }, (_, i) => {
+            const label = chalk.bold(`[#${submitted + i + 1}]`);
+          return generateReview(rateOptions.openrouterKey, profId, {
+              rating: rateOptions.rating ?? 5,
+              difficulty: rateOptions.difficulty ?? 2,
+              wouldTakeAgain: rateOptions.wouldTakeAgain ?? 'Yes',
+              grade: rateOptions.grade || pickGrade(rateOptions.rating ?? 5),
+            }, label, rateOptions.groqKey).catch(() => null);
+          })
+        );
+        console.log(chalk.green(`${batchLabel} ✓ Reviews ready, launching browsers...`));
+      }
 
       const tasks = Array.from({ length: batchWorkers }, (_, i) => {
         const globalIdx = submitted + i + 1;
         const label = chalk.bold(`[#${globalIdx}]`);
         return (async () => {
           try {
-            await rateProfessor(profId, { ...rateOptions, _attemptLabel: label });
+            let workerOptions = { ...rateOptions, _attemptLabel: label };
+            if (preGenerated[i]) workerOptions._generatedReview = preGenerated[i];
+            if (rateOptions._cookieAccounts) {
+              const picked = await pickCookieSafe(profId);
+              if (!picked) {
+                console.log(chalk.yellow(`${label} No unused cookie accounts left — stopping.`));
+                return { idx: globalIdx, success: false, exhausted: true };
+              }
+              workerOptions.cookies = picked.cookies;
+            }
+            await rateProfessor(profId, workerOptions);
             console.log(chalk.green(`${label} ✓ Submitted`));
             return { idx: globalIdx, success: true };
           } catch (err) {
@@ -1018,15 +1292,23 @@ async function main() {
       const results = await Promise.allSettled(tasks);
       const resolved = results.map(r => r.value ?? r.reason);
 
-      let batchPassed = 0, batchFailed = 0;
+      let batchPassed = 0, batchFailed = 0, batchExhausted = 0;
       for (const r of resolved) {
-        if (r?.success) batchPassed++; else batchFailed++;
+        if (r?.exhausted) batchExhausted++;
+        else if (r?.success) batchPassed++;
+        else batchFailed++;
       }
-      submitted += batchWorkers;
+      submitted += batchWorkers - batchExhausted;
       totalPassed += batchPassed;
       totalFailed += batchFailed;
 
       console.log(chalk.cyan(`── ${batchLabel} done: `) + chalk.green(`${batchPassed} passed`) + chalk.white(', ') + chalk.red(`${batchFailed} failed`) + chalk.white(` | Total so far: ${submitted} (${totalPassed} ✓ ${totalFailed} ✗)`));
+
+      // Stop looping if all workers in this batch had no accounts left
+      if (batchExhausted === batchWorkers) {
+        console.log(chalk.yellow(`\nAll cookie accounts exhausted for prof ${profId}. Done!`));
+        break;
+      }
     }
 
     console.log(chalk.cyan(`\n${'═'.repeat(40)}`));
